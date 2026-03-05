@@ -1,7 +1,9 @@
+import math
+
 from transformers import PretrainedConfig
 
 
-class MokioMindConfig(PretrainedConfig):
+class MindConfig(PretrainedConfig):
     model_type = "mokiomind"
 
     def __init__(
@@ -74,7 +76,7 @@ import torch
 import torch.nn as nn
 #集成nn.Module类
 class RMSNorm(nn.Module):
-    def __init__(self, dim:int, eps:float = 1e-5):
+    def __init__(self,dim:int,eps:float=1e-5):
         super().__init__()
         self.dim = dim
         self.eps = eps
@@ -86,3 +88,64 @@ class RMSNorm(nn.Module):
 #forward
     def forward(self, x):
         return self.weight * self._norm(x.float()).type_as(x)
+def precompute_freqs_cis(dim:int,end:int(32*1024),rope_base,rope_scaling=None):
+    #初始化rope频率
+    freqs, attn_factor = (1.0 / (rope_base**(torch.arange(0, dim, 2)[dim // 2].float() / dim)), 1.0)
+    if rope_scaling is not None:
+        orig_max, factor, beta_fast, beta_slow = (
+            rope_scaling["original_max_position_embeddings"],
+            rope_scaling["factor"],
+            rope_scaling["beta_fast"],
+            rope_scaling["beta_slow"],
+        )
+    #推断的长度大于训练长度就缩放
+        if end > orig_max:
+            #波长b到i的映射
+            inv_dim = lambda b: (dim*math.log(orig_max / (b*2*math.pi))) / (2*math.log(rope_base))
+            #low:高频不需要缩放
+            #high:低频需要缩放
+            low,high = (max(math.floor(inv_dim(beta_fast)), 0), math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
+            #计算缩放因子
+            #low之前，ramp为0，high之后为1
+            ramp = torch.clamp(
+                (torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001),
+                0,
+                1,
+            )
+            
+            freq = freqs * (1 - ramp + ramp / factor)
+        t = torch.arange(end, device=freqs.device).float()
+        #计算外积
+        freqs = torch.outer(t, freqs).float()
+        freqs_cos = (
+            torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+        )
+        freqs_sin = (
+            torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+        )
+        return freqs_cos, freqs_sin
+#rope位置编码
+def apply_rotary_pos_emb(q, k, cos, sin, position_id=None,unsqueeze_dim=1):
+    def rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+    #x_rotated = x * cos + rotate_half(x) * sin
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
+    return q_embed, k_embed
+
+def repeat_kv(x:torch.Tensor, n_rep:int)->torch.Tensor:
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:,:,:,None,:]
+        .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    )
+class Attention(nn.Module):
+    def __init__(self, args:MindConfig):
+        super().__init__()
+        self.num_attention_heads = args.num_attention_heads
+        
